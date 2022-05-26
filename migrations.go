@@ -1,12 +1,14 @@
 package Celeritas
 
 import (
-	_ "github.com/go-sql-driver/mysql"
+	"log"
+
 	"github.com/golang-migrate/migrate/v4"
+
+	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/golang-migrate/migrate/v4/database/mysql"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
-	"log"
 )
 
 func (c *Celeritas) MigrateUp(dsn string) error {
