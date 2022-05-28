@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"github.com/CloudyKit/jet/v6"
 	"github.com/alexedwards/scs/v2"
+	"github.com/gomodule/redigo/redis"
+	"github.com/koopa0/Celeritas/cache"
 	"github.com/koopa0/Celeritas/session"
 	"log"
 	"net/http"
@@ -21,18 +23,20 @@ const version = "1.0.0"
 // Celeritas is the overall type for the Celeritas package. Members that are exported in this type
 // are available to any application that uses it.
 type Celeritas struct {
-	AppName  string
-	Debug    bool
-	Version  string
-	ErrorLog *log.Logger
-	InfoLog  *log.Logger
-	RootPath string
-	Routes   *chi.Mux
-	Render   *render.Render
-	Session  *scs.SessionManager
-	DB       Database
-	JetViews *jet.Set
-	config   config
+	AppName       string
+	Debug         bool
+	Version       string
+	ErrorLog      *log.Logger
+	InfoLog       *log.Logger
+	RootPath      string
+	Routes        *chi.Mux
+	Render        *render.Render
+	Session       *scs.SessionManager
+	DB            Database
+	JetViews      *jet.Set
+	config        config
+	EncryptionKey string
+	Cache         cache.Cache
 }
 
 type config struct {
@@ -41,6 +45,7 @@ type config struct {
 	cookie      cookieConfig
 	sessionType string
 	database    databaseConfig
+	redis       redisConfig
 }
 
 // New reads the .env file, creates our application config, populates the Celeritas type with settings
@@ -83,6 +88,11 @@ func (c *Celeritas) New(rootPath string) error {
 		}
 	}
 
+	if os.Getenv("CACHE") == "redis" {
+		myRedisCache := c.createClientRedisCache()
+		c.Cache = myRedisCache
+	}
+
 	c.InfoLog = infoLog
 	c.ErrorLog = errorLog
 	c.Debug, _ = strconv.ParseBool(os.Getenv("DEBUG"))
@@ -105,6 +115,11 @@ func (c *Celeritas) New(rootPath string) error {
 			database: os.Getenv("DATABASE_TYPE"),
 			dsn:      c.BuildDSN(),
 		},
+		redis: redisConfig{
+			host:     os.Getenv("REDIS_HOST"),
+			password: os.Getenv("REDIS_PASSWORD"),
+			prefix:   os.Getenv("REDIS_PREFIX"),
+		},
 	}
 
 	// create session
@@ -119,6 +134,7 @@ func (c *Celeritas) New(rootPath string) error {
 	}
 
 	c.Session = sess.InitSession()
+	c.EncryptionKey = os.Getenv("KEY")
 
 	var views = jet.NewSet(
 		jet.NewOSFileSystemLoader(fmt.Sprintf("%s/views", rootPath)),
@@ -182,6 +198,7 @@ func (c *Celeritas) startLoggers() (*log.Logger, *log.Logger) {
 }
 
 func (c *Celeritas) createRenderer() {
+
 	myRenderer := render.Render{
 		Renderer: c.config.renderer,
 		RootPath: c.RootPath,
@@ -190,6 +207,34 @@ func (c *Celeritas) createRenderer() {
 		Session:  c.Session,
 	}
 	c.Render = &myRenderer
+}
+
+func (c *Celeritas) createClientRedisCache() *cache.RedisCache {
+
+	cacheClient := cache.RedisCache{
+		Conn:   c.createRedisPool(),
+		Prefix: c.config.redis.prefix,
+	}
+
+	return &cacheClient
+}
+
+func (c *Celeritas) createRedisPool() *redis.Pool {
+	return &redis.Pool{
+		MaxIdle:     50,
+		MaxActive:   10000,
+		IdleTimeout: 240 * time.Second,
+		Dial: func() (redis.Conn, error) {
+			return redis.Dial("tcp",
+				c.config.redis.host,
+				redis.DialPassword(c.config.redis.password))
+		},
+
+		TestOnBorrow: func(conn redis.Conn, t time.Time) error {
+			_, err := conn.Do("PING")
+			return err
+		},
+	}
 }
 
 func (c *Celeritas) BuildDSN() string {
