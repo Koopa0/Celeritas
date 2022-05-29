@@ -1,12 +1,15 @@
 package Celeritas
 
+import "C"
 import (
 	"fmt"
 	"github.com/CloudyKit/jet/v6"
 	"github.com/alexedwards/scs/v2"
+	"github.com/dgraph-io/badger/v3"
 	"github.com/gomodule/redigo/redis"
 	"github.com/koopa0/Celeritas/cache"
 	"github.com/koopa0/Celeritas/session"
+	"github.com/robfig/cron/v3"
 	"log"
 	"net/http"
 	"os"
@@ -19,6 +22,11 @@ import (
 )
 
 const version = "1.0.0"
+
+var myRedisCache *cache.RedisCache
+var myBadgerCache *cache.BadgerCache
+var redisPool *redis.Pool
+var badgerConn *badger.DB
 
 // Celeritas is the overall type for the Celeritas package. Members that are exported in this type
 // are available to any application that uses it.
@@ -37,6 +45,7 @@ type Celeritas struct {
 	config        config
 	EncryptionKey string
 	Cache         cache.Cache
+	Scheduler     *cron.Cron
 }
 
 type config struct {
@@ -88,9 +97,26 @@ func (c *Celeritas) New(rootPath string) error {
 		}
 	}
 
-	if os.Getenv("CACHE") == "redis" {
-		myRedisCache := c.createClientRedisCache()
+	scheduler := cron.New()
+	c.Scheduler = scheduler
+
+	if os.Getenv("CACHE") == "redis" || os.Getenv("SESSION_TYPE") == "redis" {
+		myRedisCache = c.createClientRedisCache()
 		c.Cache = myRedisCache
+		redisPool = myRedisCache.Conn
+	}
+
+	if os.Getenv("CACHE") == "badger" {
+		myBadgerCache = c.createClientBadgerCache()
+		c.Cache = myBadgerCache
+		badgerConn = myBadgerCache.Conn
+
+		_, err = c.Scheduler.AddFunc("@daily", func() {
+			_ = myBadgerCache.Conn.RunValueLogGC(0.7)
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	c.InfoLog = infoLog
@@ -130,18 +156,32 @@ func (c *Celeritas) New(rootPath string) error {
 		CookieName:     c.config.cookie.name,
 		SessionType:    c.config.sessionType,
 		CookieDomain:   c.config.cookie.domain,
-		DBPool:         c.DB.Pool,
+	}
+
+	switch c.config.sessionType {
+	case "redis":
+		sess.RedisPool = myRedisCache.Conn
+	case "mysql", "postgres", "mariadb", "postgresql":
+		sess.DBPool = c.DB.Pool
 	}
 
 	c.Session = sess.InitSession()
 	c.EncryptionKey = os.Getenv("KEY")
 
-	var views = jet.NewSet(
-		jet.NewOSFileSystemLoader(fmt.Sprintf("%s/views", rootPath)),
-		jet.InDevelopmentMode(),
-	)
-
-	c.JetViews = views
+	if c.Debug {
+		var views = jet.NewSet(
+			jet.NewOSFileSystemLoader(fmt.Sprintf("%s/views", rootPath)),
+			// 可以直接更改html 不用重啟就可以套用 開發時再開 會降低jet渲染速度
+			jet.InDevelopmentMode(),
+		)
+		c.JetViews = views
+	} else {
+		var views = jet.NewSet(
+			jet.NewOSFileSystemLoader(fmt.Sprintf("%s/views", rootPath)),
+			//jet.InDevelopmentMode(),
+		)
+		c.JetViews = views
+	}
 
 	c.createRenderer()
 
@@ -172,7 +212,17 @@ func (c *Celeritas) ListenAndServe() {
 		WriteTimeout: 600 * time.Second,
 	}
 
-	defer c.DB.Pool.Close()
+	if c.DB.Pool != nil {
+		defer c.DB.Pool.Close()
+	}
+
+	if redisPool != nil {
+		defer redisPool.Close()
+	}
+
+	if badgerConn != nil {
+		defer badgerConn.Close()
+	}
 
 	c.InfoLog.Printf("Listening on port %s", os.Getenv("PORT"))
 	err := srv.ListenAndServe()
@@ -219,6 +269,15 @@ func (c *Celeritas) createClientRedisCache() *cache.RedisCache {
 	return &cacheClient
 }
 
+func (c *Celeritas) createClientBadgerCache() *cache.BadgerCache {
+
+	cacheClient := cache.BadgerCache{
+		Conn: c.createBadgerConn(),
+	}
+
+	return &cacheClient
+}
+
 func (c *Celeritas) createRedisPool() *redis.Pool {
 	return &redis.Pool{
 		MaxIdle:     50,
@@ -235,6 +294,16 @@ func (c *Celeritas) createRedisPool() *redis.Pool {
 			return err
 		},
 	}
+}
+
+func (c *Celeritas) createBadgerConn() *badger.DB {
+
+	db, err := badger.Open(badger.DefaultOptions(c.RootPath + "/tmp/badger"))
+	if err != nil {
+		return nil
+	}
+
+	return db
 }
 
 func (c *Celeritas) BuildDSN() string {
